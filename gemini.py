@@ -6,14 +6,10 @@ import mimetypes
 import time
 import argparse
 import tempfile
-import magic
 from google.api_core import exceptions as google_exceptions
 
 SUPPORTED_MIME_TYPES = [
-    'text/plain', 'text/html', 'text/css', 'text/javascript',
-    'application/x-javascript', 'text/x-typescript', 'application/x-typescript',
-    'text/csv', 'text/markdown', 'text/x-python', 'application/x-python-code',
-    'application/json', 'text/xml', 'application/rtf', 'text/rtf'
+    'text/plain', 
 ]
 
 def get_mime_type(filepath):
@@ -21,19 +17,6 @@ def get_mime_type(filepath):
     if mime_type in SUPPORTED_MIME_TYPES:
         return mime_type
     return 'text/plain'  # Default to text/plain for unsupported types
-
-def verify_mime_types(directory):
-    for filepath in glob.glob(f"{directory}/**/*", recursive=True):
-        if os.path.isfile(filepath):
-            mime = magic.Magic(mime=True)
-            detected_mime = mime.from_file(filepath)
-            guessed_mime = get_mime_type(filepath)
-            relative_path = os.path.relpath(filepath, directory)
-            print(f"File: {relative_path}")
-            print(f"  Detected MIME: {detected_mime}")
-            print(f"  Guessed MIME: {guessed_mime}")
-            if detected_mime != guessed_mime:
-                print("  WARNING: MIME type mismatch!")
 
 def get_last_lines(filepath, max_lines=1000):
     """Get the last 'max_lines' lines from a file."""
@@ -69,7 +52,7 @@ def truncate_file(filepath, max_lines=1000):
         temp_file.write(last_lines)
         return temp_file.name
 
-def upload_file_with_retry(filepath, display_name, mime_type, max_retries=5, base_wait_time=5, max_lines=50):
+def upload_file_with_retry(filepath, display_name, mime_type, max_retries=5, base_wait_time=5, max_lines=100, force_mime_type=None):
     truncated_filepath = truncate_file(filepath, max_lines)
     file_size = os.path.getsize(truncated_filepath)
     
@@ -77,7 +60,7 @@ def upload_file_with_retry(filepath, display_name, mime_type, max_retries=5, bas
         try:
             print(f"Attempting to upload last {max_lines} lines of {filepath} (Size: {file_size/1024/1024:.2f}MB)")
             start_time = time.time()
-            file_response = genai.upload_file(path=truncated_filepath, display_name=display_name, mime_type=mime_type)
+            file_response = genai.upload_file(path=truncated_filepath, display_name=display_name, mime_type=force_mime_type or mime_type)
             upload_time = time.time() - start_time
             print(f"Successfully uploaded truncated {filepath} in {upload_time:.2f} seconds")
             os.unlink(truncated_filepath)  # Delete the temporary file
@@ -116,7 +99,7 @@ def count_tokens_with_retry(model, file_response, max_retries=5, base_wait_time=
             else:
                 raise
 
-def upload_files(directory, model):
+def upload_files(directory, model, force_mime_type=None):
     uploaded_files = []
     skipped_files = []
     total_tokens = 0
@@ -128,7 +111,7 @@ def upload_files(directory, model):
             mime_type = get_mime_type(filepath)
             print(f"File: {relative_path}, MIME type: {mime_type}")
             try:
-                file_response = upload_file_with_retry(filepath, relative_path, mime_type)
+                file_response = upload_file_with_retry(filepath, relative_path, mime_type, force_mime_type=force_mime_type)
                 
                 try:
                     file_tokens = count_tokens_with_retry(model, file_response)
@@ -216,7 +199,6 @@ def list_uploaded_files():
         print(f"An error occurred while listing files: {e}")
         return []
 
-# Function to delete a file by its ID
 def delete_file(file_id):
     try:
         genai.delete_file(file_id)
@@ -224,15 +206,26 @@ def delete_file(file_id):
     except Exception as e:
         print(f"An error occurred while deleting the file: {e}")
 
-# Function to clean up all files
 def cleanup_all_files():
     files = list_uploaded_files()
     for file in files:
         delete_file(file.name)
 
+def verify_mime_types(directory):
+    for filepath in glob.glob(f"{directory}/**/*", recursive=True):
+        if os.path.isfile(filepath):
+            mime_type = get_mime_type(filepath)
+            relative_path = os.path.relpath(filepath, directory)
+            print(f"File: {relative_path}")
+            print(f"  MIME type: {mime_type}")
+            if mime_type not in SUPPORTED_MIME_TYPES:
+                print("  WARNING: Unsupported MIME type, will be treated as text/plain")
+
 def main():
     parser = argparse.ArgumentParser(description="Upload files and chat with Gemini model.")
     parser.add_argument("directory", help="Directory containing files to upload")
+    parser.add_argument("--verify-mime", action="store_true", help="Verify MIME types before uploading")
+    parser.add_argument("--force-mime", help="Force all files to use this MIME type")
     args = parser.parse_args()
 
     # Get API key from environment variable
@@ -245,8 +238,16 @@ def main():
     model_name = "models/gemini-1.5-pro-latest"
     model = genai.GenerativeModel(model_name=model_name)
 
+    if args.verify_mime:
+        print("Verifying MIME types...")
+        verify_mime_types(args.directory)
+        proceed = input("Do you want to proceed with the upload? (y/n): ")
+        if proceed.lower() != 'y':
+            print("Aborting upload.")
+            return
+
     cleanup_all_files()
-    uploaded_files, skipped_files, total_tokens = upload_files(args.directory, model)
+    uploaded_files, skipped_files, total_tokens = upload_files(args.directory, model, force_mime_type=args.force_mime)
 
     if total_tokens >= 2000000:
         print("Warning: Maximum token limit reached. Some files may have been skipped.")
@@ -256,15 +257,12 @@ def main():
         for file in skipped_files:
             print(f"- {file}")
 
-
     system_prompt = ("You are an AI assistant with access to several uploaded files. "
                      "When the user asks a question, you can analyze and refer to these files to provide information. "
                      "The files may contain logs, configuration data, or other relevant information.")
 
     chat_with_model(model, system_prompt, uploaded_files)
-
     cleanup_files(uploaded_files)
-
 
 if __name__ == "__main__":
     main()
