@@ -237,8 +237,8 @@ def main():
     model_name = "models/gemini-1.5-pro-latest"
     model = genai.GenerativeModel(model_name=model_name)
 
-    print("Cleaning up any existing files...")
-    cleanup_all_files(max_workers=args.max_workers)
+    #print("Cleaning up any existing files...")
+    #cleanup_all_files(max_workers=args.max_workers)
 
     uploaded_files = []
     try:
