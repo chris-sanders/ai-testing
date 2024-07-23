@@ -10,6 +10,8 @@ import json
 import google.generativeai as genai
 from google.api_core import exceptions as google_exceptions
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from google.generativeai.types import HarmCategory, HarmBlockThreshold
+
 
 SUPPORTED_MIME_TYPES = ['text/plain']
 
@@ -31,7 +33,7 @@ def is_json(content):
     except json.JSONDecodeError:
         return False
 
-def upload_file_with_retry(filepath, display_name, mime_type, max_retries=5, base_wait_time=5, max_lines=100, max_size_no_truncate=51200, force_mime_type=None):
+def upload_file_with_retry(filepath, display_name, mime_type, max_retries=5, base_wait_time=5, max_lines=75, max_size_no_truncate=104800, force_mime_type=None):
     relative_path = os.path.relpath(filepath)
     
     with open(filepath, 'r', encoding='utf-8', errors='replace') as file:
@@ -142,12 +144,24 @@ def cleanup_files(uploaded_files, max_workers=10):
             except Exception as e:
                 print(f"Failed to delete {file.display_name}: {str(e)}")
 
-def chat_with_model(model, system_prompt, uploaded_files, use_history=False):
+def chat_with_model(model, system_prompt, uploaded_files, use_history=True):
     print("Chat started. Type 'exit' or press Ctrl+D to end the conversation.")
     print("AI: Hello! I'm ready to help you with any questions about the uploaded files. What would you like to know?")
 
+    file_info = "The following files are available for reference:\n" + "\n".join([f"- {file.display_name}" for file in uploaded_files])
+
+    safety_settings = {
+        HarmCategory.HARM_CATEGORY_HATE_SPEECH: HarmBlockThreshold.BLOCK_NONE,
+        HarmCategory.HARM_CATEGORY_HARASSMENT: HarmBlockThreshold.BLOCK_NONE,
+        HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT: HarmBlockThreshold.BLOCK_NONE,
+        HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT: HarmBlockThreshold.BLOCK_NONE,
+    }
+
     if use_history:
-        chat = model.start_chat(history=[])
+        history = [
+            {"role": "user", "parts": [system_prompt, file_info] + uploaded_files}
+        ]
+        chat = model.start_chat(history=history)
     else:
         chat = None
 
@@ -158,22 +172,23 @@ def chat_with_model(model, system_prompt, uploaded_files, use_history=False):
                 if user_input.lower() == 'exit':
                     break
                 
-                full_prompt = [
-                    system_prompt,
-                    f"User question: {user_input}",
-                    "Please analyze the attached files to answer the question. Each file begins with metadata including its file path.",
-                    "The following files are available for reference:",
-                    *[f"- {file.display_name}" for file in uploaded_files],
-                ] + uploaded_files
+                if use_history:
+                    response = chat.send_message(user_input, stream=True, safety_settings=safety_settings)
+                else:
+                    full_prompt = [
+                        {"role": "user", "parts": [
+                            system_prompt,
+                            file_info,
+                            f"User question: {user_input}",
+                            "Please analyze the attached files to answer the question. Each file begins with metadata including its file path."
+                        ] + uploaded_files}
+                    ]
+                    response = model.generate_content(full_prompt, stream=True, safety_settings=safety_settings)
 
                 print("AI: ", end="", flush=True)
-                if use_history:
-                    response = chat.send_message(full_prompt, stream=True)
-                else:
-                    response = model.generate_content(full_prompt, stream=True)
-                
                 for chunk in response:
-                    print(chunk.text, end="", flush=True)
+                    if chunk.text:
+                        print(chunk.text, end="", flush=True)
                 print()  # New line after the complete response
 
             except EOFError:
@@ -211,7 +226,7 @@ def main():
     parser.add_argument("directory", help="Directory containing files to upload")
     parser.add_argument("--force-mime", help="Force all files to use this MIME type")
     parser.add_argument("--max-workers", type=int, default=20, help="Maximum number of parallel uploads")
-    parser.add_argument("--use-history", action="store_true", help="Maintain chat history between queries")
+    parser.add_argument("--no-history", action="store_true", help="Do not maintain chat history between queries")
     args = parser.parse_args()
 
     api_key = os.environ.get("GEMINI_API_KEY")
@@ -239,9 +254,9 @@ def main():
 
         system_prompt = ("You are an AI assistant with access to several uploaded files. "
                          "When the user asks a question, you can analyze and refer to these files to provide information. "
-                         "The files may contain logs, configuration data, or other relevant information.")
+                         "The files need to be cross referenced they each only contain partial information. " )
 
-        chat_with_model(model, system_prompt, uploaded_files, use_history=args.use_history)
+        chat_with_model(model, system_prompt, uploaded_files, use_history=not args.no_history)
 
     finally:
         print("Cleaning up uploaded files...")
